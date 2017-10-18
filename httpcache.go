@@ -9,6 +9,7 @@ package httpcache
 import (
 	"bufio"
 	"bytes"
+	"crypto/md5"
 	"errors"
 	"fmt"
 	"io"
@@ -28,6 +29,12 @@ const (
 	XFromCache = "X-From-Cache"
 )
 
+type nopCloser struct {
+	io.Reader
+}
+
+func (nopCloser) Close() error { return nil }
+
 // A Cache interface is used by the Transport to store and retrieve responses.
 type Cache interface {
 	// Get returns the []byte representation of a cached response and a bool
@@ -40,18 +47,27 @@ type Cache interface {
 }
 
 // cacheKey returns the cache key for req.
-func cacheKey(req *http.Request) string {
+func cacheKey(req *http.Request, body []byte) string {
 	if req.Method == http.MethodGet {
 		return req.URL.String()
 	} else {
-		return req.Method + " " + req.URL.String()
+		h := md5.New()
+		bodyHash := fmt.Sprintf("%x", h.Sum(body))
+		return req.Method + " " + req.URL.String() + " " + bodyHash
 	}
 }
 
 // CachedResponse returns the cached http.Response for req if present, and nil
 // otherwise.
 func CachedResponse(c Cache, req *http.Request) (resp *http.Response, err error) {
-	cachedVal, ok := c.Get(cacheKey(req))
+	var buf bytes.Buffer
+	tee := io.TeeReader(req.Body, &buf)
+	body, err := ioutil.ReadAll(tee)
+	if err != nil {
+		return nil, err
+	}
+	req.Body = nopCloser{&buf}
+	cachedVal, ok := c.Get(cacheKey(req, body))
 	if !ok {
 		return
 	}
@@ -138,8 +154,15 @@ func varyMatches(cachedResp *http.Response, req *http.Request) bool {
 // to give the server a chance to respond with NotModified. If this happens, then the cached Response
 // will be returned.
 func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error) {
-	cacheKey := cacheKey(req)
-	cacheable := (req.Method == "GET" || req.Method == "HEAD") && req.Header.Get("range") == ""
+	var buf bytes.Buffer
+	tee := io.TeeReader(req.Body, &buf)
+	body, err := ioutil.ReadAll(tee)
+	if err != nil {
+		return nil, err
+	}
+	req.Body = nopCloser{&buf}
+	cacheKey := cacheKey(req, body)
+	cacheable := (req.Method == "GET" || req.Method == "POST" || req.Method == "HEAD") && req.Header.Get("range") == ""
 	var cachedResp *http.Response
 	if cacheable {
 		cachedResp, err = CachedResponse(t.Cache, req)
@@ -156,62 +179,9 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 	if cacheable && cachedResp != nil && err == nil {
 		if t.MarkCachedResponses {
 			cachedResp.Header.Set(XFromCache, "1")
-		}
-
-		if varyMatches(cachedResp, req) {
-			// Can only use cached value if the new request doesn't Vary significantly
-			freshness := getFreshness(cachedResp.Header, req.Header)
-			if freshness == fresh {
-				return cachedResp, nil
-			}
-
-			if freshness == stale {
-				var req2 *http.Request
-				// Add validators if caller hasn't already done so
-				etag := cachedResp.Header.Get("etag")
-				if etag != "" && req.Header.Get("etag") == "" {
-					req2 = cloneRequest(req)
-					req2.Header.Set("if-none-match", etag)
-				}
-				lastModified := cachedResp.Header.Get("last-modified")
-				if lastModified != "" && req.Header.Get("last-modified") == "" {
-					if req2 == nil {
-						req2 = cloneRequest(req)
-					}
-					req2.Header.Set("if-modified-since", lastModified)
-				}
-				if req2 != nil {
-					req = req2
-				}
-			}
-		}
-
-		resp, err = transport.RoundTrip(req)
-		if err == nil && req.Method == "GET" && resp.StatusCode == http.StatusNotModified {
-			// Replace the 304 response with the one from cache, but update with some new headers
-			endToEndHeaders := getEndToEndHeaders(resp.Header)
-			for _, header := range endToEndHeaders {
-				cachedResp.Header[header] = resp.Header[header]
-			}
-			cachedResp.Status = fmt.Sprintf("%d %s", http.StatusOK, http.StatusText(http.StatusOK))
-			cachedResp.StatusCode = http.StatusOK
-
-			resp = cachedResp
-		} else if (err != nil || (cachedResp != nil && resp.StatusCode >= 500)) &&
-			req.Method == "GET" && canStaleOnError(cachedResp.Header, req.Header) {
-			// In case of transport failure and stale-if-error activated, returns cached content
-			// when available
-			cachedResp.Status = fmt.Sprintf("%d %s", http.StatusOK, http.StatusText(http.StatusOK))
-			cachedResp.StatusCode = http.StatusOK
 			return cachedResp, nil
-		} else {
-			if err != nil || resp.StatusCode != http.StatusOK {
-				t.Cache.Delete(cacheKey)
-			}
-			if err != nil {
-				return nil, err
-			}
 		}
+
 	} else {
 		reqCacheControl := parseCacheControl(req.Header)
 		if _, ok := reqCacheControl["only-if-cached"]; ok {
@@ -234,6 +204,8 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 			}
 		}
 		switch req.Method {
+		case "POST":
+			fallthrough
 		case "GET":
 			// Delay caching until EOF is reached.
 			resp.Body = &cachingReadCloser{
