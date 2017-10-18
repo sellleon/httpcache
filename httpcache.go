@@ -33,8 +33,6 @@ type nopCloser struct {
 	io.Reader
 }
 
-func (nopCloser) Close() error { return nil }
-
 // A Cache interface is used by the Transport to store and retrieve responses.
 type Cache interface {
 	// Get returns the []byte representation of a cached response and a bool
@@ -66,7 +64,7 @@ func CachedResponse(c Cache, req *http.Request) (resp *http.Response, err error)
 	if err != nil {
 		return nil, err
 	}
-	req.Body = nopCloser{&buf}
+	req.Body = ioutil.NopCloser(&buf)
 	cachedVal, ok := c.Get(cacheKey(req, body))
 	if !ok {
 		return
@@ -160,7 +158,7 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 	if err != nil {
 		return nil, err
 	}
-	req.Body = nopCloser{&buf}
+	req.Body = ioutil.NopCloser(&buf)
 	cacheKey := cacheKey(req, body)
 	cacheable := (req.Method == "GET" || req.Method == "POST" || req.Method == "HEAD") && req.Header.Get("range") == ""
 	var cachedResp *http.Response
